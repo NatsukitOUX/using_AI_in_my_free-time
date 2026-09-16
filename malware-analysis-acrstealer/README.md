@@ -1,0 +1,243 @@
+# 🦠 Anatomy of a Fake Installer: How Malware Hides in Plain Sight
+
+> A step-by-step breakdown of a real piece of malware — written so **anyone** can follow the story,
+> with the deep technical detail tucked away for those who want it.
+
+This is a walkthrough of a real malware sample I analyzed end to end: how it tricks people, how it
+hides, what it steals, and how I uncovered the hidden server it reports back to. It doubles as a
+case study in modern malware evasion.
+
+---
+
+## 🧭 The 30-second version
+
+Someone downloads what looks like a normal software installer. It even contains a **real, genuine
+program** to look legitimate — but hidden alongside it is a booby-trapped file. When run, that file
+quietly unpacks a **password stealer** in several disguised layers, injects it into a trusted Windows
+program (`explorer.exe`) so antivirus is less likely to notice, and then phones home to its operator
+using **encrypted DNS** — a clever trick that hides *which server* it's talking to from normal network
+monitoring.
+
+The malware family is **ACRStealer**. Its home server (the "command-and-control" address) is
+`login[.]junebrook[.]cc`. Its goal: **steal saved passwords, browser cookies, and cryptocurrency wallets.**
+
+---
+
+## 📊 At a glance
+
+| | |
+|---|---|
+| **What it is** | ACRStealer — an information stealer (sold as a service to criminals) |
+| **How it spreads** | A fake software installer ("ClickFix" lure) — the readme even tells victims to turn off antivirus |
+| **What it steals** | Saved passwords, browser cookies, crypto wallets, system info |
+| **How it hides** | Fake filenames, disguised layers, injects into a trusted Windows process |
+| **How it phones home** | Encrypted DNS (DNS-over-HTTPS) to `login[.]junebrook[.]cc` |
+| **Danger level** | 🔴 High |
+| **Detection when found** | 21 of 70 antivirus engines (day-one, before it was widely known) |
+
+---
+
+## 🕵️ How the attack works — the story in 4 acts
+
+Each act is explained in plain language first. Expand the **"🔬 Technical detail"** box under each if
+you want the specifics.
+
+### Act 1 — The disguise 🎭
+
+The victim receives a password-protected ZIP that looks like a software setup. Inside are several
+**real, genuinely-signed programs** (a copy of Python) sitting next to the malicious file — so
+everything *looks* trustworthy. One file uses a sneaky trick: its name looks like `Setup.exe`, but the
+"p" is actually a **Cyrillic letter** that looks identical. A readme tells the victim to disable their
+antivirus and VPN "so the installer works."
+
+<details><summary>🔬 Technical detail</summary>
+
+- Delivery: `SETUP_FILE_(KEY=2129).zip` via `thsyjsk[.]co` → MediaFire, ZipCrypto password shown as an image.
+- Filename homoglyph: `Setuр.exe` uses Cyrillic `р` (U+0440). It is a **genuine signed `pythonw.exe`**.
+- **DLL side-loading:** it loads a tampered `python36.dll` (actually a signed Embarcadero RTL BPL with a
+  broken/invalid signature) whose patched `DllMain` runs the malware *before* Python starts.
+- MITRE ATT&CK: `T1204.004` (ClickFix), `T1574.002` (DLL side-loading), `T1036.005/.001` (masquerading).
+
+</details>
+
+### Act 2 — The Russian nesting doll 🪆
+
+The real payload is wrapped in several **encrypted layers**, like a nesting doll. Each layer, when
+opened, reveals the key to the next one. This is done so that no single file on disk looks obviously
+malicious, and so automated scanners can't see what's inside.
+
+<details><summary>🔬 Technical detail</summary>
+
+- An AES-encrypted blob (`svga3dsw.dll`, entropy 7.9998) is decrypted with a **static** key:
+  `SHA-256("GAFRyTkeyxVlkLq")`.
+- Each layer re-wraps the next in a custom **`1R0P`** container that carries the next stage's key.
+- Additional layers use a custom XOR stream cipher plus **LZNT1** decompression to reveal stages 2 and 3.
+- MITRE ATT&CK: `T1140` (deobfuscate), `T1027.013/.002` (encrypted/packed).
+
+</details>
+
+### Act 3 — Hiding inside a trusted program 👤
+
+Instead of running as its own suspicious program, the malware **hijacks a legitimate Windows program**
+(`explorer.exe`) and runs *inside* it — a technique called **process hollowing**. To security software,
+it looks like Windows itself is doing the activity.
+
+<details><summary>🔬 Technical detail</summary>
+
+- Stage 2 is a **direct-syscall injector** (bypasses common antivirus hooks). It hollows
+  `C:\Windows\SysWOW64\explorer.exe`.
+- It writes the payload, **zeroes the entry point** in the file header, patches
+  `PEB→ImageBaseAddress`, and jumps to the real entry.
+- A copy is also dropped to `C:\Windows\Temp\~DF<random hex>.tmp` (mimics Office temp files).
+- **Tell-tale sign:** a **32-bit `explorer.exe`** running from `SysWOW64` is not normal — the real
+  Explorer is 64-bit.
+- MITRE ATT&CK: `T1055.012` (process hollowing), `T1106` (native API / direct syscalls), `T1620`.
+
+</details>
+
+### Act 4 — The secret phone call 📞
+
+Finally, the stealer needs to contact its operator. Normally you could catch this by watching DNS
+lookups. But this malware uses **DNS-over-HTTPS (DoH)** — it asks Google's encrypted DNS service to
+look up its secret server, so the request is hidden inside normal-looking encrypted web traffic. That's
+why nothing showed up in standard network logs.
+
+<details><summary>🔬 Technical detail</summary>
+
+- Disguised as Microsoft's `WPA.exe` ("Windows Performance Analyzer").
+- Passes an anti-analysis gate (checks for debuggers/sandboxes), fingerprints the machine
+  (`MachineGuid`, computer name, username, OS), then resolves **`login[.]junebrook[.]cc`** via DoH
+  (`hxxps://dns[.]google/dns-query`) and beacons over HTTPS.
+- Hardcoded resolvers: `8.8.8.8 / 8.8.4.4 / 1.1.1.1 / 1.0.0.1` on port 443.
+- MITRE ATT&CK: `T1071.004` (DNS), `T1573` (encrypted channel), `T1008` (fallback channels), `T1568`.
+
+</details>
+
+---
+
+## 🔍 How I found the hidden server (the interesting part)
+
+The malware was built to resist analysis: its code is scrambled, it looks up Windows functions by
+secret codes instead of names, and the server address is never written in plain text in the file. Every
+attempt to crack it by **reading the file** failed.
+
+So I ran it in a safe, isolated lab and caught it in the act:
+
+1. **Ran it in a sandbox** — an isolated virtual machine with no real internet, so it couldn't actually
+   reach the criminals.
+2. **Froze it mid-attack** — a script watched for the moment the malware hijacked `explorer.exe` and
+   instantly paused that process before it could disappear (it only lived ~1 second).
+3. **Took a memory snapshot** — because the malware *has* to decrypt its config to use it, the secret
+   server address sits in plain text in memory, even though it's encrypted on disk.
+4. **Found the server** — `login[.]junebrook[.]cc` was right there in the snapshot, and it matched a
+   known ACRStealer campaign in public malware databases.
+
+> 💡 **The lesson:** you can't always beat well-obfuscated malware by reading it. Sometimes you let it
+> unlock itself, then look at its memory.
+
+---
+
+## ✅ Independent confirmation
+
+- The unpacked sample was uploaded to **VirusTotal** — flagged malicious by **21/70** engines
+  (CrowdStrike "100% confidence", Avast/AVG tagged it `[Pws]` = password stealer).
+- The command-and-control address matches a **MalwareBazaar** campaign tagged as **ACRStealer**.
+- All fingerprinting fields, the fake "WPA.exe" identity, the encrypted config resource, and the decoy
+  imports seen by VirusTotal exactly match the hands-on analysis.
+
+---
+
+## 📖 Glossary (for non-technical readers)
+
+| Term | In plain words |
+|---|---|
+| **Payload** | The actual harmful program (here, the password stealer) |
+| **C2 / command-and-control** | The criminals' server that the malware reports to and takes orders from |
+| **Process hollowing** | Hiding malware *inside* a legitimate running program |
+| **DNS-over-HTTPS (DoH)** | Encrypted address lookups — hides *which* server is being contacted |
+| **Infostealer** | Malware whose job is to steal saved passwords, cookies, and wallets |
+| **Obfuscation** | Deliberately scrambling code so it's hard to analyze |
+| **IOC (Indicator of Compromise)** | A clue (a domain, file hash, filename) that shows a machine may be infected |
+
+---
+
+## 🛡️ For defenders — Indicators of Compromise (IOCs)
+
+> Addresses are **defanged** (`[.]`, `hxxps`) so they aren't accidentally clickable. Remove the brackets to use them.
+
+**Network**
+```
+C2 domain     login[.]junebrook[.]cc
+DoH endpoint  hxxps://dns[.]google/dns-query
+Resolvers     8.8.8.8 / 8.8.4.4 / 1.1.1.1 / 1.0.0.1  (TCP 443, hardcoded)
+Delivery      thsyjsk[.]co  →  MediaFire quickkey 4i1h8sh77u5nxay
+```
+
+**Host artifacts**
+```
+32-bit explorer.exe running from C:\Windows\SysWOW64\   (anomaly — real Explorer is 64-bit)
+C:\Windows\Temp\~DF<16 hex>.tmp                          (dropped payload, 601,600 bytes)
+python36.dll with an invalid Authenticode signature      (the loader)
+```
+
+<details><summary>📦 File hashes (SHA-256)</summary>
+
+```
+b448ce2b90102e5e2243d19dd19e3518677b1e4aa93cd7bdda0735a70112ef3e  outer archive
+1c6b21573efa368862a9c18656f5766803cef3138b6695547ccd1d622cc04636  loader (tampered RTL DLL)
+587787022ad4f7bdd827e8b655b0ba8f7538d5d4b26d4a0b9721ee4db22b909e  encrypted payload blob
+b25ec15e057127d04b9e8613c06556a2bacd1810162bcde03317a77783c7a10a  stage 1
+a3a10e7b7da5c31f49cf4846aa8d4e668e9f8d14a2cf8cddb26ad825b1a48ddb  stage 2 (injector)
+f5922501d885c193d832a54bb48085e0f49b19cd180e3ca57ba52e459a3d6a3d  stage 3 (ACRStealer payload)
+```
+
+Related samples on MalwareBazaar (same campaign, different hashes):
+```
+23c8fd28f886ef40763e6b0fd2052cbd2d94655e3ebc165df22170d19b592949  (dll)  ACRStealer
+492125caa52f8cba760dda3e1d099a264db9c4f10588514d144f258b49b22be1  (zip)  ACRStealer
+```
+
+imphash: `590ad9e20aea6b98506ec18e1ea3f1a5`
+
+</details>
+
+**Recommended actions**
+- Block and alert on `login[.]junebrook[.]cc` across DNS, DoH, and TLS logs.
+- Flag outbound **DoH to public resolvers from non-browser processes** — the key evasion here.
+- Hunt for a **32-bit `explorer.exe`** and `~DF<hex>.tmp` files of exactly 601,600 bytes.
+- Treat infected hosts as **credential-compromised** — reset passwords and sessions (browser logins,
+  cookies, and crypto wallets are the targets).
+- ⚠️ Because the malware uses encrypted DNS, **a clean DNS log does not mean a clean machine** — pivot
+  on process and host indicators instead.
+
+<details><summary>🗺️ Full MITRE ATT&CK mapping</summary>
+
+| Tactic | Technique | ID |
+|---|---|---|
+| Initial Access | User Execution: ClickFix / Malicious File | T1204.004 / T1204.002 |
+| Defense Evasion | DLL Side-Loading | T1574.002 |
+| Defense Evasion | Masquerading (name / invalid signature) | T1036.005 / T1036.001 |
+| Defense Evasion | Deobfuscate / Encrypted / Packed | T1140 / T1027.013 / T1027.002 |
+| Defense Evasion | Dynamic API Resolution | T1027.007 |
+| Defense Evasion | Native API (direct syscalls) | T1106 |
+| Defense Evasion | Process Hollowing / Reflective Loading | T1055.012 / T1620 |
+| Defense Evasion | Debugger / Sandbox Evasion | T1622 / T1497 |
+| Defense Evasion | Timestomp / zeroed entry point | T1070.006 |
+| Discovery | System / Process Discovery | T1082 / T1057 |
+| Collection | Credentials from Stores / Cookies (ACRStealer) | T1555 / T1539 |
+| Command & Control | Application Layer Protocol: DNS (DoH) | T1071.004 |
+| Command & Control | Encrypted Channel / Fallback / Dynamic Resolution | T1573 / T1008 / T1568 |
+
+</details>
+
+---
+
+## ⚖️ Notes & disclaimer
+
+This report is for **educational and defensive purposes**. No malware samples are included in this
+repository — only analysis, findings, and indicators. All indicators are already publicly documented
+(VirusTotal, MalwareBazaar). Family attribution is corroborated by the MalwareBazaar tag
+`login-junebrook-cc` (signature: ACRStealer).
+
+*Analysis conducted in an isolated lab environment. Written up as part of a hands-on malware-analysis
+exercise.*
